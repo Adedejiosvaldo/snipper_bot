@@ -22,7 +22,9 @@ import Image from "next/image";
 import { useRouter } from "next/navigation";
 
 const SOCKET_SERVER_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  typeof process.env.NEXT_PUBLIC_API_URL !== "undefined"
+    ? process.env.NEXT_PUBLIC_API_URL
+    : "http://localhost:8000";
 
 interface Group {
   id: string;
