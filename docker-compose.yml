@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  backend-sniper:
+    build: ./backend
+    container_name: whatsapp_sniper_backend
+    restart: always
+    volumes:
+      # Mount these locally so a container restart doesn't drop active connections or users
+      - ./backend/sessions:/app/sessions
+      - ./backend/data:/app/data
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=8000
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  frontend-dashboard:
+    build:
+      context: ./frontend
+      # Pass an empty API URL so it uses relative paths for the Nginx proxy
+      args:
+        NEXT_PUBLIC_API_URL: ""
+    container_name: whatsapp_sniper_frontend
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - backend-sniper
+
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: whatsapp_sniper_nginx
+    restart: always
+    ports:
+      # Expose standard HTTP port 80/443 to the Hostinger VPS
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend-dashboard
+      - backend-sniper
