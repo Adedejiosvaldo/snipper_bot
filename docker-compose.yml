@@ -37,8 +37,8 @@ services:
     container_name: whatsapp_sniper_nginx
     restart: always
     ports:
-      # Expose standard HTTP port 80/443 to the Hostinger VPS
-      - "80:80"
+      # Expose on Port 8080 because the Host VPS already has a Docker container on Port 80
+      - "8080:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:

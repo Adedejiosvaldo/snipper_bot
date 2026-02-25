@@ -48,8 +48,8 @@ echo "Building and starting Docker containers..."
 echo "This might take a few minutes..."
 
 # Pass the empty API URL so Next.js builds relative URLs
-NEXT_PUBLIC_API_URL="" docker-compose build
-docker-compose up -d
+NEXT_PUBLIC_API_URL="" docker compose build
+docker compose up -d
 
 echo ""
 echo "=========================================="
@@ -58,4 +58,4 @@ echo "=========================================="
 echo "Your SaaS dashboard is now running and bound to public Port 80."
 echo "Master Password: $MASTER_PASS"
 echo ""
-echo "To view logs, run: docker-compose logs -f"
+echo "To view logs, run: docker compose logs -f"
