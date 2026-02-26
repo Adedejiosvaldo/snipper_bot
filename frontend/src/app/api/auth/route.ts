@@ -21,7 +21,7 @@ export async function POST(request: Request) {
         name: "sniper_auth",
         value: "authenticated",
         httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
+        secure: request.url.startsWith("https"),
         sameSite: "lax",
         path: "/",
         maxAge: 60 * 60 * 24 * 7, // 1 week
