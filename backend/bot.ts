@@ -26,7 +26,14 @@ const activeConfigs = new Map<
   string,
   { target_group_id: string; delay_tier: number; name: string }
 >();
+const firedToday = new Map<string, string>(); // userId -> "YYYY-MM-DD" last fired
 const MAX_RECONNECT_ATTEMPTS = 5;
+
+// Sniper Window Configuration (Africa/Lagos timezone)
+const SNIPER_WINDOW_START_HOUR = 15; // 3 PM
+const SNIPER_WINDOW_START_MIN = 58; // 3:58 PM
+const SNIPER_WINDOW_END_HOUR = 16; // 4 PM
+const SNIPER_WINDOW_END_MIN = 5; // 4:05 PM
 
 // Group metadata cache — stores participant lists + addressing_mode to prevent
 // WhatsApp from rate-limiting us and to enable proper LID addressing
@@ -229,6 +236,50 @@ export async function startBotForUser(
             update.id === userConfig.target_group_id &&
             update.announce === false
           ) {
+            // --- TIME GATE: Only fire Mon-Fri, 3:58 PM - 4:05 PM (Africa/Lagos) ---
+            const now = new Date(
+              new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos" }),
+            );
+            const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
+            const hours = now.getHours();
+            const minutes = now.getMinutes();
+            const totalMins = hours * 60 + minutes;
+            const windowStart =
+              SNIPER_WINDOW_START_HOUR * 60 + SNIPER_WINDOW_START_MIN; // 958
+            const windowEnd =
+              SNIPER_WINDOW_END_HOUR * 60 + SNIPER_WINDOW_END_MIN; // 965
+
+            // Weekend check
+            if (dayOfWeek === 0 || dayOfWeek === 6) {
+              emitLog(
+                userId,
+                "warn",
+                `📅 Weekend detected. Sniper paused until Monday.`,
+              );
+              return;
+            }
+
+            // Time window check
+            if (totalMins < windowStart || totalMins > windowEnd) {
+              emitLog(
+                userId,
+                "warn",
+                `⏰ Outside sniper window (${hours}:${String(minutes).padStart(2, "0")}). Window: 3:58 PM - 4:05 PM.`,
+              );
+              return;
+            }
+
+            // Already fired today check
+            const todayStr = now.toISOString().split("T")[0];
+            if (firedToday.get(userId) === todayStr) {
+              emitLog(
+                userId,
+                "warn",
+                `✅ Already fired today (${todayStr}). Holding fire until tomorrow.`,
+              );
+              return;
+            }
+
             const isReady = sniperReady.get(userId) || false;
             emitLog(
               userId,
@@ -236,13 +287,16 @@ export async function startBotForUser(
               `⚡ GROUP UNLOCKED! Armed: ${isReady}. FIRING in ${userConfig.delay_tier}ms`,
             );
 
+            // Mark as fired today BEFORE sending to prevent duplicate fires
+            firedToday.set(userId, todayStr);
+
             setTimeout(async () => {
               await sendWithRetry(
                 sock,
                 userConfig.target_group_id,
                 userConfig.name,
                 userId,
-                10, // More retries for LID groups
+                10,
               );
             }, userConfig.delay_tier);
           }
