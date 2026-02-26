@@ -296,7 +296,7 @@ export async function startBotForUser(
                 userConfig.target_group_id,
                 userConfig.name,
                 userId,
-                10,
+                3,
               );
             }, userConfig.delay_tier);
           }
