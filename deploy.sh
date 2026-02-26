@@ -30,7 +30,8 @@ if [[ -z "$MASTER_PASS" ]]; then
 fi
 
 echo "Locking Nginx to $EXACT_DOMAIN..."
-sed -i "s/server_name _;/server_name $EXACT_DOMAIN;/" nginx.conf
+# Make sed idempotent: reset to wildcard first, then set domain
+sed -i "s/server_name .*/server_name $EXACT_DOMAIN;/" nginx.conf
 
 echo "Updating .env..."
 cat << EOF > .env
@@ -44,18 +45,23 @@ EOF
 echo "✓ .env file created!"
 
 echo ""
+echo "Stopping any existing containers..."
+docker compose down 2>/dev/null || true
+
+echo ""
 echo "Building and starting Docker containers..."
 echo "This might take a few minutes..."
 
-# Pass the empty API URL so Next.js builds relative URLs
-NEXT_PUBLIC_API_URL="" docker compose build
+# Force fresh build so code changes are always picked up
+NEXT_PUBLIC_API_URL="" docker compose build --no-cache
 docker compose up -d
 
 echo ""
 echo "=========================================="
 echo " Deployment Complete!"
 echo "=========================================="
-echo "Your SaaS dashboard is now running and bound to public Port 80."
+echo "Your SaaS dashboard is now running on Port 8080."
+echo "URL: http://$EXACT_DOMAIN:8080"
 echo "Master Password: $MASTER_PASS"
 echo ""
 echo "To view logs, run: docker compose logs -f"
