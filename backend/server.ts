@@ -91,6 +91,7 @@ app.delete("/api/session/:userId", async (req: Request, res: Response) => {
   db.run("DELETE FROM users WHERE id = ?", [userId], (err) => {
     if (err) console.error("DB wait Error:", err);
   });
+  db.run("DELETE FROM user_logs WHERE user_id = ?", [userId]);
 
   // 2. Logout socket if active
   const sock = getSocket(userId);
@@ -132,6 +133,19 @@ app.get("/api/groups/:userId", async (req: Request, res: Response) => {
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
+});
+
+app.get("/api/logs/:userId", (req: Request, res: Response) => {
+  const { userId } = req.params;
+  const limit = Math.min(parseInt(req.query.limit as string) || 200, 500);
+  db.all(
+    "SELECT level, message, created_at FROM user_logs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+    [userId, limit],
+    (err, rows: any[]) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ logs: (rows as any[]).reverse() });
+    },
+  );
 });
 
 app.post("/api/test-fire", async (req: Request, res: Response) => {

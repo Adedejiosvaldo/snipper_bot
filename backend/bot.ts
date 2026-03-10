@@ -9,7 +9,7 @@ import {
 import pino from "pino";
 import path from "path";
 import fs from "fs";
-import db from "./database";
+import db, { insertLog } from "./database";
 import qrcodeLib from "qrcode";
 import { Boom } from "@hapi/boom";
 import NodeCache from "node-cache";
@@ -51,10 +51,13 @@ export function emitLog(
   else if (level === "warn") console.warn(`[${userId}] ${message}`);
   else console.log(`[${userId}] ${message}`);
 
+  insertLog(userId, level, formattedMsg);
+
   if ((global as any).io) {
     (global as any).io.emit(`sniper-log-${userId}`, {
       level,
       message: formattedMsg,
+      created_at: Date.now(),
     });
   }
 }
@@ -216,90 +219,107 @@ export async function startBotForUser(
         }
       }
 
-      // --- Cache group metadata on updates (prevents rate limits) ---
-      sock.ev.on("groups.update", async (updates) => {
-        for (const update of updates) {
-          try {
-            const metadata = await sock.groupMetadata(update.id!);
-            groupCache.set(update.id!, metadata);
-          } catch {
-            // ignore
+      // --- SNIPER LOGIC + metadata cache refresh ---
+      sock.ev.on("groups.update", (updates) => {
+        // ✅ FAST PATH FIRST: check + fire using only in-memory config (zero network latency)
+        const userConfig = activeConfigs.get(userId);
+        if (userConfig) {
+          for (const update of updates) {
+            if (
+              update.id === userConfig.target_group_id &&
+              update.announce === false
+            ) {
+              // --- TIME GATE: Only fire Mon-Fri, 3:58 PM - 4:05 PM (Africa/Lagos) ---
+              const now = new Date(
+                new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos" }),
+              );
+              const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
+              const hours = now.getHours();
+              const minutes = now.getMinutes();
+              const totalMins = hours * 60 + minutes;
+              const windowStart =
+                SNIPER_WINDOW_START_HOUR * 60 + SNIPER_WINDOW_START_MIN; // 958
+              const windowEnd =
+                SNIPER_WINDOW_END_HOUR * 60 + SNIPER_WINDOW_END_MIN; // 965
+
+              // Weekend check
+              if (dayOfWeek === 0 || dayOfWeek === 6) {
+                emitLog(
+                  userId,
+                  "warn",
+                  `📅 Weekend detected. Sniper paused until Monday.`,
+                );
+                continue;
+              }
+
+              // Time window check
+              if (totalMins < windowStart || totalMins > windowEnd) {
+                emitLog(
+                  userId,
+                  "warn",
+                  `⏰ Outside sniper window (${hours}:${String(minutes).padStart(2, "0")}). Window: 3:58 PM - 4:05 PM.`,
+                );
+                continue;
+              }
+
+              // Already fired today check
+              const todayStr = now.toISOString().split("T")[0];
+              if (firedToday.get(userId) === todayStr) {
+                emitLog(
+                  userId,
+                  "warn",
+                  `✅ Already fired today (${todayStr}). Holding fire until tomorrow.`,
+                );
+                continue;
+              }
+
+              // Mark as fired BEFORE sending to prevent duplicate fires
+              firedToday.set(userId, todayStr);
+
+              const isReady = sniperReady.get(userId) || false;
+
+              // For delay_tier=0: fire directly without setTimeout overhead
+              if (userConfig.delay_tier === 0) {
+                sendWithRetry(
+                  sock,
+                  userConfig.target_group_id,
+                  userConfig.name,
+                  userId,
+                  3,
+                ).catch((err: any) =>
+                  emitLog(userId, "error", `Fire error: ${err?.message}`),
+                );
+              } else {
+                setTimeout(() => {
+                  sendWithRetry(
+                    sock,
+                    userConfig.target_group_id,
+                    userConfig.name,
+                    userId,
+                    3,
+                  ).catch((err: any) =>
+                    emitLog(userId, "error", `Fire error: ${err?.message}`),
+                  );
+                }, userConfig.delay_tier);
+              }
+
+              emitLog(
+                userId,
+                "info",
+                `⚡ GROUP UNLOCKED! Armed: ${isReady}. FIRING in ${userConfig.delay_tier}ms`,
+              );
+            }
           }
         }
 
-        // --- SNIPER LOGIC (Optimized Hot Path) ---
-        const userConfig = activeConfigs.get(userId);
-        if (!userConfig) return;
-
+        // ✅ ASYNC BACKGROUND: refresh metadata cache AFTER firing (non-blocking)
         for (const update of updates) {
-          if (
-            update.id === userConfig.target_group_id &&
-            update.announce === false
-          ) {
-            // --- TIME GATE: Only fire Mon-Fri, 3:58 PM - 4:05 PM (Africa/Lagos) ---
-            const now = new Date(
-              new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos" }),
-            );
-            const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
-            const hours = now.getHours();
-            const minutes = now.getMinutes();
-            const totalMins = hours * 60 + minutes;
-            const windowStart =
-              SNIPER_WINDOW_START_HOUR * 60 + SNIPER_WINDOW_START_MIN; // 958
-            const windowEnd =
-              SNIPER_WINDOW_END_HOUR * 60 + SNIPER_WINDOW_END_MIN; // 965
-
-            // Weekend check
-            if (dayOfWeek === 0 || dayOfWeek === 6) {
-              emitLog(
-                userId,
-                "warn",
-                `📅 Weekend detected. Sniper paused until Monday.`,
-              );
-              return;
-            }
-
-            // Time window check
-            if (totalMins < windowStart || totalMins > windowEnd) {
-              emitLog(
-                userId,
-                "warn",
-                `⏰ Outside sniper window (${hours}:${String(minutes).padStart(2, "0")}). Window: 3:58 PM - 4:05 PM.`,
-              );
-              return;
-            }
-
-            // Already fired today check
-            const todayStr = now.toISOString().split("T")[0];
-            if (firedToday.get(userId) === todayStr) {
-              emitLog(
-                userId,
-                "warn",
-                `✅ Already fired today (${todayStr}). Holding fire until tomorrow.`,
-              );
-              return;
-            }
-
-            const isReady = sniperReady.get(userId) || false;
-            emitLog(
-              userId,
-              "info",
-              `⚡ GROUP UNLOCKED! Armed: ${isReady}. FIRING in ${userConfig.delay_tier}ms`,
-            );
-
-            // Mark as fired today BEFORE sending to prevent duplicate fires
-            firedToday.set(userId, todayStr);
-
-            setTimeout(async () => {
-              await sendWithRetry(
-                sock,
-                userConfig.target_group_id,
-                userConfig.name,
-                userId,
-                3,
-              );
-            }, userConfig.delay_tier);
-          }
+          sock
+            .groupMetadata(update.id!)
+            .then((meta) => {
+              groupCache.set(update.id!, meta);
+            })
+            .catch(() => {});
         }
       });
 
@@ -341,8 +361,10 @@ export async function startBotForUser(
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             const attempts = reconnectAttempts.get(userId) || 0;
 
-            console.log(
-              `[${userId}] Connection closed (status: ${statusCode}). Attempt ${attempts + 1}/${MAX_RECONNECT_ATTEMPTS}. Reconnecting: ${shouldReconnect}`,
+            emitLog(
+              userId,
+              "warn",
+              `🔌 Connection closed (status: ${statusCode}). Attempt ${attempts + 1}/${MAX_RECONNECT_ATTEMPTS}. Reconnecting: ${shouldReconnect}`,
             );
 
             activeSockets.delete(userId);
@@ -350,22 +372,18 @@ export async function startBotForUser(
 
             if (shouldReconnect && attempts < MAX_RECONNECT_ATTEMPTS) {
               if (statusCode === DisconnectReason.restartRequired) {
-                console.log(
-                  `[${userId}] Restart required. Reconnecting instantly...`,
-                );
+                emitLog(userId, "warn", `🔄 Restart required. Reconnecting instantly...`);
                 startBotForUser(userId).catch(console.error);
               } else {
                 reconnectAttempts.set(userId, attempts + 1);
                 const delay = Math.pow(2, attempts + 1) * 1000;
-                console.log(
-                  `[${userId}] Waiting ${delay / 1000}s before reconnecting...`,
-                );
+                emitLog(userId, "warn", `🔄 Waiting ${delay / 1000}s before reconnecting... (attempt ${attempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
                 setTimeout(() => {
                   startBotForUser(userId).catch(console.error);
                 }, delay);
               }
             } else if (!shouldReconnect) {
-              console.log(`[${userId}] User logged out. Cleaning up session.`);
+              emitLog(userId, "error", `🔴 SESSION LOGGED OUT — please rescan QR to reconnect.`);
               db.run("UPDATE users SET session_status = ? WHERE id = ?", [
                 "disconnected",
                 userId,
@@ -380,9 +398,7 @@ export async function startBotForUser(
                 );
               }
             } else {
-              console.error(
-                `[${userId}] Max reconnect attempts reached. Stopping.`,
-              );
+              emitLog(userId, "error", `🔴 Max reconnect attempts reached. Session halted — please reconnect manually.`);
               reconnectAttempts.delete(userId);
               db.run("UPDATE users SET session_status = ? WHERE id = ?", [
                 "error",

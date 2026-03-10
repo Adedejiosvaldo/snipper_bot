@@ -34,6 +34,7 @@ interface Group {
 interface LogEntry {
   level: "info" | "warn" | "error";
   message: string;
+  created_at?: number;
 }
 
 export default function Dashboard() {
@@ -65,6 +66,20 @@ export default function Dashboard() {
   // Console State
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsLoadedAt = useRef(0);
+
+  const fetchLogs = async (uid: string) => {
+    logsLoadedAt.current = Date.now();
+    try {
+      const res = await fetch(
+        `${SOCKET_SERVER_URL}/api/logs/${uid}?limit=200`,
+      );
+      const data = await res.json();
+      if (data.logs) setLogs(data.logs);
+    } catch {
+      /* silent */
+    }
+  };
 
   const fetchSavedUsers = async () => {
     try {
@@ -132,16 +147,16 @@ export default function Dashboard() {
       setPairingCode("");
       setStatus("connected");
       fetchGroups(activeUserId);
-      setLogs((prev) => [
-        ...prev,
-        { level: "info", message: `[SYS] Session ${activeUserId} Ready` },
-      ]);
+      fetchLogs(activeUserId);
     };
     const onPairingCode = (code: string) => {
       setPairingCode(code);
       setStatus("pairing");
     };
-    const onLog = (log: LogEntry) => setLogs((prev) => [...prev, log]);
+    const onLog = (log: LogEntry) => {
+      if (log.created_at && log.created_at < logsLoadedAt.current) return;
+      setLogs((prev) => [...prev, log]);
+    };
 
     socket.on(`qr-${activeUserId}`, onQr);
     socket.on(`ready-${activeUserId}`, onReady);
@@ -180,7 +195,7 @@ export default function Dashboard() {
     setStatus("loading");
     setUserId(targetId);
     setActiveUserId(targetId);
-    setLogs([]); // Clear logs for new active session
+    setLogs([]); // Clear logs while loading
 
     try {
       const res = await fetch(
@@ -193,12 +208,7 @@ export default function Dashboard() {
         setPairingCode("");
         setStatus("connected");
         fetchGroups(targetId);
-        setLogs([
-          {
-            level: "info",
-            message: `[SYS] Attached to active session: ${targetId}`,
-          },
-        ]);
+        fetchLogs(targetId); // Load historical logs from DB
       } else {
         socket?.emit("start-session", { userId: targetId, usePairingCode });
       }
@@ -484,6 +494,13 @@ export default function Dashboard() {
                           <p className="text-[10px] text-zinc-500 font-mono mt-0.5">
                             {u.id}
                           </p>
+                          <p
+                            className={`text-[10px] font-medium mt-0.5 ${u.session_status === "connected" ? "text-green-400" : "text-red-400"}`}
+                          >
+                            {u.session_status === "connected"
+                              ? "Active"
+                              : "Session lost"}
+                          </p>
                         </div>
                         <div
                           className={`w-2 h-2 rounded-full ${u.session_status === "connected" ? "bg-green-500" : "bg-red-500"}`}
@@ -649,10 +666,26 @@ export default function Dashboard() {
                     node_{activeUserId || "offline"}.log
                   </span>
                 </div>
-                <div className="flex items-center gap-1.5 opacity-50">
-                  <span className="w-2.5 h-2.5 rounded-full bg-red-500"></span>
-                  <span className="w-2.5 h-2.5 rounded-full bg-yellow-500"></span>
-                  <span className="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+                <div className="flex items-center gap-3">
+                  {logs.length > 0 && (
+                    <span className="text-[10px] text-zinc-600 font-mono">
+                      {logs.length} lines
+                    </span>
+                  )}
+                  {logs.length > 0 && (
+                    <button
+                      onClick={() => setLogs([])}
+                      className="text-zinc-600 hover:text-zinc-400 transition-colors"
+                      title="Clear logs"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                  <div className="flex items-center gap-1.5 opacity-50">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-yellow-500"></span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+                  </div>
                 </div>
               </div>
 
@@ -669,8 +702,8 @@ export default function Dashboard() {
                         className={`
                         ${log.level === "error" ? "text-red-400" : ""}
                         ${log.level === "warn" ? "text-yellow-400" : ""}
-                        ${log.level === "info" && log.message.includes("🚀") ? "text-green-400 font-bold" : ""}
-                        ${log.level === "info" && !log.message.includes("🚀") ? "text-zinc-300" : ""}
+                        ${log.level === "info" && (log.message.includes("🚀") || log.message.includes("🎯") || log.message.includes("⚡") || log.message.includes("✅")) ? "text-green-400 font-bold" : ""}
+                        ${log.level === "info" && !(log.message.includes("🚀") || log.message.includes("🎯") || log.message.includes("⚡") || log.message.includes("✅")) ? "text-zinc-300" : ""}
                       `}
                       >
                         {log.message}
