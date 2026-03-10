@@ -43,14 +43,15 @@ db.all("SELECT * FROM users", [], (err, rows: any[]) => {
 // API Routes
 app.post("/api/users", (req: Request, res: Response) => {
   const { id, name, target_group_id, delay_tier = 0 } = req.body;
+  const sessionStatus = getSocket(id) ? "connected" : "disconnected";
   db.run(
-    `INSERT INTO users (id, name, target_group_id, delay_tier)
-         VALUES (?, ?, ?, ?)
+    `INSERT INTO users (id, name, target_group_id, delay_tier, session_status)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
          name=excluded.name,
          target_group_id=excluded.target_group_id,
          delay_tier=excluded.delay_tier`,
-    [id, name, target_group_id, delay_tier],
+    [id, name, target_group_id, delay_tier, sessionStatus],
     function (err) {
       if (err) {
         return res.status(500).json({ error: err.message });
