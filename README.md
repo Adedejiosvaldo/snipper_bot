@@ -63,6 +63,32 @@ docker compose logs -f
 - **Trigger:** Group `announce` flag changes to `false` (group unlocked)
 - **Rate limit:** One fire per user per calendar day
 
+## Fire Speed
+
+The fire path lives in `backend/sniper.ts`:
+
+- **Raw unlock trigger** — listens for the `w:gp2` / `not_announcement` notification straight off the socket, before Baileys converts it into a `groups.update` event (kept as a backup trigger).
+- **Pre-window warmup** — on connect, on config change and every weekday at 15:56 it loads group members, their devices and an encryption session with every device, so the send needs no extra round trips.
+- **In-memory key store** — encryption keys are read from memory; disk writes happen in the background.
+- **Direct relay** — sends a plain text message with `relayMessage` (no link-preview lookup, no own-message re-processing).
+- **Quiet connection** — background metadata refreshes are skipped during the window.
+- **Timing logs** — each fire logs unlock receive time, send write time, and server ack RTT.
+- **Persistent daily lock** — `users.last_fired_day` stops a restart from firing twice in one day.
+
+### Burst mode (experimental, off by default)
+
+Sends a few times around a predicted unlock time instead of waiting for the notification. Saves roughly one network hop, but risks duplicate posts and WhatsApp flagging repeated rejected sends. Use only if the timing logs show the unlock happens at the same moment every day.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SNIPER_BURST_ENABLED` | `false` | Turn burst mode on |
+| `SNIPER_BURST_AT` | `16:00:00.000` | Predicted unlock time (Lagos) |
+| `SNIPER_BURST_LEAD_MS` | `150` | Start this many ms before `SNIPER_BURST_AT` |
+| `SNIPER_BURST_COUNT` | `5` | Number of attempts |
+| `SNIPER_BURST_GAP_MS` | `40` | Gap between attempts |
+
+The burst stops at the first accepted send. If the unlock notification arrives first, the bot waits (up to 1.5s) for in-flight burst acks before firing normally, so it never posts twice.
+
 ## Data Persistence
 
 Session credentials and the SQLite database are mounted as Docker volumes so they survive container restarts:

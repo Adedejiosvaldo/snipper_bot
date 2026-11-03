@@ -13,6 +13,7 @@ import db, { insertLog } from "./database";
 import qrcodeLib from "qrcode";
 import { Boom } from "@hapi/boom";
 import NodeCache from "node-cache";
+import { Sniper, SniperConfig, inSniperWindow, makeFastKeyStore } from "./sniper";
 
 const sessionsDir = path.join(__dirname, "..", "sessions");
 if (!fs.existsSync(sessionsDir)) {
@@ -22,18 +23,21 @@ if (!fs.existsSync(sessionsDir)) {
 export const activeSockets = new Map<string, WASocket>();
 const reconnectAttempts = new Map<string, number>();
 export const sniperReady = new Map<string, boolean>();
-const activeConfigs = new Map<
-  string,
-  { target_group_id: string; delay_tier: number; name: string }
->();
-const firedToday = new Map<string, string>(); // userId -> "YYYY-MM-DD" last fired
+const snipers = new Map<string, Sniper>();
 const MAX_RECONNECT_ATTEMPTS = 5;
 
-// Sniper Window Configuration (Africa/Lagos timezone)
-const SNIPER_WINDOW_START_HOUR = 15; // 3 PM
-const SNIPER_WINDOW_START_MIN = 58; // 3:58 PM
-const SNIPER_WINDOW_END_HOUR = 16; // 4 PM
-const SNIPER_WINDOW_END_MIN = 5; // 4:05 PM
+// WA Web version: fetch once per process, not on every reconnect.
+let waVersion: Promise<[number, number, number]> | null = null;
+function getWaVersion() {
+  if (!waVersion) {
+    waVersion = fetchLatestBaileysVersion().then(({ version, isLatest }) => {
+      console.log(`Using WA Web v${version.join(".")}, isLatest: ${isLatest}`);
+      return version as [number, number, number];
+    });
+    waVersion.catch(() => (waVersion = null));
+  }
+  return waVersion;
+}
 
 // Group metadata cache — stores participant lists + addressing_mode to prevent
 // WhatsApp from rate-limiting us and to enable proper LID addressing
@@ -62,100 +66,6 @@ export function emitLog(
   }
 }
 
-async function sendWithRetry(
-  sock: WASocket,
-  groupId: string,
-  name: string,
-  userId: string,
-  maxRetries: number,
-) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      await sock.sendMessage(groupId, { text: name });
-      emitLog(
-        userId,
-        "info",
-        `🚀 Sent Payload: "${name}" (attempt ${attempt}/${maxRetries})`,
-      );
-      return;
-    } catch (e: any) {
-      const msg = e?.message || "";
-      const isSessionError =
-        msg.includes("No sessions") ||
-        msg.includes("No SenderKeyRecord") ||
-        msg.includes("session");
-      const isFatalReject =
-        msg.includes("not-acceptable") || msg.includes("forbidden");
-
-      if (isFatalReject) {
-        emitLog(
-          userId,
-          "error",
-          `🚫 WhatsApp rejected: "${msg}". Not retrying.`,
-        );
-        return;
-      }
-
-      if (isSessionError && attempt < maxRetries) {
-        emitLog(
-          userId,
-          "warn",
-          `⏳ Signal session not ready (LID sync). Retrying in 5s... (${attempt}/${maxRetries})`,
-        );
-        // Re-fetch group metadata to refresh addressing_mode and participant cache
-        try {
-          const meta = await sock.groupMetadata(groupId);
-          groupCache.set(groupId, meta);
-        } catch {
-          // ignore
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      } else {
-        emitLog(
-          userId,
-          "error",
-          `❌ Failed to send (attempt ${attempt}/${maxRetries}): ${msg}`,
-        );
-        if (attempt < maxRetries) await new Promise((r) => setTimeout(r, 3000));
-        else return;
-      }
-    }
-  }
-}
-
-async function warmupGroupSession(
-  sock: WASocket,
-  userId: string,
-  groupId: string,
-  maxAttempts = 12,
-): Promise<boolean> {
-  for (let i = 1; i <= maxAttempts; i++) {
-    try {
-      const meta = await sock.groupMetadata(groupId);
-      groupCache.set(groupId, meta);
-      emitLog(
-        userId,
-        "info",
-        `🔑 Group "${meta.subject}" cached (${meta.participants.length} members)`,
-      );
-      return true;
-    } catch (e: any) {
-      emitLog(
-        userId,
-        "warn",
-        `⏳ Warming up sessions... (${i}/${maxAttempts})`,
-      );
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-  }
-  emitLog(
-    userId,
-    "error",
-    `❌ Failed to warm up after ${maxAttempts} attempts`,
-  );
-  return false;
-}
-
 interface BotOptions {
   usePairingCode?: boolean;
 }
@@ -177,14 +87,21 @@ export async function startBotForUser(
     try {
       const userSessionDir = path.join(sessionsDir, userId);
       const { state, saveCreds } = await useMultiFileAuthState(userSessionDir);
-      const { version, isLatest } = await fetchLatestBaileysVersion();
-      console.log(
-        `[${userId}] Using WA Web v${version.join(".")}, isLatest: ${isLatest}`,
-      );
+      const version = await getWaVersion();
 
       const sock = makeWASocket({
         version,
-        auth: state,
+        // Keys served from memory; disk writes happen in the background.
+        auth: {
+          creds: state.creds,
+          keys: makeFastKeyStore(state.keys, (e: any) =>
+            console.error(`[${userId}] key store write failed:`, e?.message),
+          ),
+        },
+        // Keep device lists for 6h so the pre-window warmup is still valid at fire time.
+        userDevicesCache: new NodeCache({ stdTTL: 6 * 60 * 60, useClones: false }),
+        // Don't re-process our own sent messages.
+        emitOwnEvents: false,
         // Suppress Baileys internal decryption errors (e.g. Bad MAC/SessionError)
         logger: pino({ level: "silent" }) as any,
         printQRInTerminal: false,
@@ -219,100 +136,28 @@ export async function startBotForUser(
         }
       }
 
-      // --- SNIPER LOGIC + metadata cache refresh ---
+      // --- SNIPER: raw-notification trigger lives inside Sniper; this is the backup ---
+      const sniper = new Sniper(
+        sock,
+        userId,
+        (level, message) => emitLog(userId, level, message),
+        groupCache,
+        (dayKey) =>
+          db.run("UPDATE users SET last_fired_day = ? WHERE id = ?", [
+            dayKey,
+            userId,
+          ]),
+      );
+      snipers.get(userId)?.dispose();
+      snipers.set(userId, sniper);
+
       sock.ev.on("groups.update", (updates) => {
-        // ✅ FAST PATH FIRST: check + fire using only in-memory config (zero network latency)
-        const userConfig = activeConfigs.get(userId);
-        if (userConfig) {
-          for (const update of updates) {
-            if (
-              update.id === userConfig.target_group_id &&
-              update.announce === false
-            ) {
-              // --- TIME GATE: Only fire Mon-Fri, 3:58 PM - 4:05 PM (Africa/Lagos) ---
-              const now = new Date(
-                new Date().toLocaleString("en-US", { timeZone: "Africa/Lagos" }),
-              );
-              const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
-              const hours = now.getHours();
-              const minutes = now.getMinutes();
-              const totalMins = hours * 60 + minutes;
-              const windowStart =
-                SNIPER_WINDOW_START_HOUR * 60 + SNIPER_WINDOW_START_MIN; // 958
-              const windowEnd =
-                SNIPER_WINDOW_END_HOUR * 60 + SNIPER_WINDOW_END_MIN; // 965
-
-              // Weekend check
-              if (dayOfWeek === 0 || dayOfWeek === 6) {
-                emitLog(
-                  userId,
-                  "warn",
-                  `📅 Weekend detected. Sniper paused until Monday.`,
-                );
-                continue;
-              }
-
-              // Time window check
-              if (totalMins < windowStart || totalMins > windowEnd) {
-                emitLog(
-                  userId,
-                  "warn",
-                  `⏰ Outside sniper window (${hours}:${String(minutes).padStart(2, "0")}). Window: 3:58 PM - 4:05 PM.`,
-                );
-                continue;
-              }
-
-              // Already fired today check
-              const todayStr = now.toISOString().split("T")[0];
-              if (firedToday.get(userId) === todayStr) {
-                emitLog(
-                  userId,
-                  "warn",
-                  `✅ Already fired today (${todayStr}). Holding fire until tomorrow.`,
-                );
-                continue;
-              }
-
-              // Mark as fired BEFORE sending to prevent duplicate fires
-              firedToday.set(userId, todayStr);
-
-              const isReady = sniperReady.get(userId) || false;
-
-              // For delay_tier=0: fire directly without setTimeout overhead
-              if (userConfig.delay_tier === 0) {
-                sendWithRetry(
-                  sock,
-                  userConfig.target_group_id,
-                  userConfig.name,
-                  userId,
-                  3,
-                ).catch((err: any) =>
-                  emitLog(userId, "error", `Fire error: ${err?.message}`),
-                );
-              } else {
-                setTimeout(() => {
-                  sendWithRetry(
-                    sock,
-                    userConfig.target_group_id,
-                    userConfig.name,
-                    userId,
-                    3,
-                  ).catch((err: any) =>
-                    emitLog(userId, "error", `Fire error: ${err?.message}`),
-                  );
-                }, userConfig.delay_tier);
-              }
-
-              emitLog(
-                userId,
-                "info",
-                `⚡ GROUP UNLOCKED! Armed: ${isReady}. FIRING in ${userConfig.delay_tier}ms`,
-              );
-            }
-          }
+        for (const update of updates) {
+          if (update.id) sniper.onGroupsUpdate(update.id, update.announce);
         }
-
-        // ✅ ASYNC BACKGROUND: refresh metadata cache AFTER firing (non-blocking)
+        // Refresh metadata in the background, but never during the window:
+        // the extra query would share the connection with our send.
+        if (inSniperWindow()) return;
         for (const update of updates) {
           sock
             .groupMetadata(update.id!)
@@ -369,6 +214,10 @@ export async function startBotForUser(
 
             activeSockets.delete(userId);
             sniperReady.set(userId, false);
+            if (snipers.get(userId) === sniper) {
+              sniper.dispose();
+              snipers.delete(userId);
+            }
 
             if (shouldReconnect && attempts < MAX_RECONNECT_ATTEMPTS) {
               if (statusCode === DisconnectReason.restartRequired) {
@@ -428,46 +277,7 @@ export async function startBotForUser(
             }
 
             // --- PROACTIVE WARMUP ---
-            db.get(
-              "SELECT * FROM users WHERE id = ?",
-              [userId],
-              async (err, user: any) => {
-                if (err || !user || !user.target_group_id) {
-                  emitLog(userId, "info", `ℹ️ No target group configured yet.`);
-                  sniperReady.set(userId, false);
-                  return;
-                }
-
-                // Cache config in memory for hot path routing
-                activeConfigs.set(userId, {
-                  target_group_id: user.target_group_id,
-                  delay_tier: user.delay_tier,
-                  name: user.name,
-                });
-
-                emitLog(userId, "info", `🔄 Warming up for target group...`);
-                const warmedUp = await warmupGroupSession(
-                  sock,
-                  userId,
-                  user.target_group_id,
-                );
-
-                sniperReady.set(userId, warmedUp);
-                if (warmedUp) {
-                  emitLog(userId, "info", `🎯 SNIPER ARMED AND READY!`);
-                  if ((global as any).io) {
-                    (global as any).io.emit(`armed-${userId}`);
-                  }
-                } else {
-                  emitLog(
-                    userId,
-                    "warn",
-                    `⚠️ Could not warm up. Will still attempt sends.`,
-                  );
-                  sniperReady.set(userId, true);
-                }
-              },
-            );
+            armSniper(userId, "ARMED AND READY");
           }
         },
       );
@@ -481,42 +291,56 @@ export async function startBotForUser(
 }
 
 export function refreshSniperReadiness(userId: string): void {
-  const sock = activeSockets.get(userId);
-  if (!sock) {
+  if (!activeSockets.has(userId)) {
     sniperReady.set(userId, false);
     return;
   }
+  armSniper(userId, "RE-ARMED");
+}
 
+/** Loads the user's config into their Sniper and warms the target group. */
+function armSniper(userId: string, label: string): void {
   db.get(
     "SELECT * FROM users WHERE id = ?",
     [userId],
     async (err, user: any) => {
-      if (err || !user || !user.target_group_id) {
+      const sniper = snipers.get(userId);
+      if (err || !user || !user.target_group_id || !sniper) {
+        emitLog(userId, "info", `ℹ️ No target group configured yet.`);
         sniperReady.set(userId, false);
         return;
       }
 
-      // Update memory cache
-      activeConfigs.set(userId, {
+      const cfg: SniperConfig = {
         target_group_id: user.target_group_id,
-        delay_tier: user.delay_tier,
+        delay_tier: Number(user.delay_tier) || 0,
         name: user.name,
-      });
-
+        last_fired_day: user.last_fired_day,
+      };
+      sniper.setConfig(cfg);
       sniperReady.set(userId, false);
-      emitLog(userId, "info", `🔄 Re-warming for ${user.target_group_id}...`);
-      const warmedUp = await warmupGroupSession(
-        sock,
-        userId,
-        user.target_group_id,
-      );
-      sniperReady.set(userId, warmedUp);
+      emitLog(userId, "info", `🔄 Warming up for target group...`);
 
+      let warmedUp = false;
+      for (let i = 1; i <= 12 && !warmedUp; i++) {
+        try {
+          warmedUp = await sniper.prewarm();
+        } catch (e: any) {
+          emitLog(userId, "warn", `⏳ Warming up... (${i}/12): ${e?.message}`);
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+        if (snipers.get(userId) !== sniper) return; // socket replaced meanwhile
+      }
+
+      // Even if warmup failed the sniper still fires; sends just do more work.
+      sniperReady.set(userId, true);
       if (warmedUp) {
-        emitLog(userId, "info", `🎯 SNIPER RE-ARMED`);
+        emitLog(userId, "info", `🎯 SNIPER ${label}!`);
         if ((global as any).io) {
           (global as any).io.emit(`armed-${userId}`);
         }
+      } else {
+        emitLog(userId, "warn", `⚠️ Could not warm up. Will still attempt sends.`);
       }
     },
   );

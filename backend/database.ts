@@ -40,6 +40,10 @@ db.serialize(() => {
   db.run(`
         CREATE INDEX IF NOT EXISTS idx_user_logs_uid ON user_logs(user_id)
     `);
+
+  // Persist the once-per-day fire lock so a restart can't fire twice.
+  // Errors with "duplicate column" on existing databases — safe to ignore.
+  db.run(`ALTER TABLE users ADD COLUMN last_fired_day TEXT`, () => {});
 });
 
 export function insertLog(

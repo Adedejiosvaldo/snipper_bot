@@ -40,6 +40,16 @@ NODE_ENV=production
 # Next.js will use relative paths for API calls because Nginx intercepts /api
 NEXT_PUBLIC_API_URL=""
 MASTER_PASSWORD=$MASTER_PASS
+
+# Burst mode (experimental): send a few times around a predicted unlock time
+# instead of waiting for the unlock notification. Risk: duplicate posts and
+# WhatsApp flagging repeated rejected sends. Leave off unless logs show the
+# group unlocks at the same moment (within ~100ms) every day.
+SNIPER_BURST_ENABLED=false
+SNIPER_BURST_AT=16:00:00.000
+SNIPER_BURST_LEAD_MS=150
+SNIPER_BURST_COUNT=5
+SNIPER_BURST_GAP_MS=40
 EOF
 
 echo "✓ .env file created!"
